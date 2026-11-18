@@ -99,7 +99,7 @@ Get-Content -Tail 20 -Wait "$env:LOCALAPPDATA\TustAutoLogin\auto-login.log"
 选定源地址  : 10.131.7.144  自动识别
 系统代理    : 无
 网关 TCP    : 可达
-门户状态    : 已在线（2308****@unicom）
+门户状态    : 已在线（****@unicom）
 ```
 
 ## 文件说明
@@ -109,7 +109,7 @@ Get-Content -Tail 20 -Wait "$env:LOCALAPPDATA\TustAutoLogin\auto-login.log"
 | `auto_login.py` | 主脚本，纯标准库 |
 | `install.ps1` | 启动项安装 / 卸载（不需要管理员权限） |
 | `%LOCALAPPDATA%\TustAutoLogin\cred.dat` | 账号密码，Windows DPAPI 加密，只有当前用户能解密 |
-| `%LOCALAPPDATA%\TustAutoLogin\auto-login.log` | 运行日志，账号已脱敏（`2308****@unicom`） |
+| `%LOCALAPPDATA%\TustAutoLogin\auto-login.log` | 运行日志，账号已脱敏（`****@unicom`） |
 
 ## 已知限制
 
