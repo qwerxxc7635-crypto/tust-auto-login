@@ -11,7 +11,7 @@
 
   说明：
     - 写的是「当前用户」的启动项，不需要管理员权限；
-    - 每次登录 Windows 自动运行，稳定在线时每 5 分钟、掉线时每 1 分钟巡检；
+    - 每次登录 Windows 自动运行，稳定在线时每 60 分钟、掉线时每 10 分钟巡检；
     - 日志：%LOCALAPPDATA%\TustAutoLogin\auto-login.log
     - 注意：升级或重装 Python 后，需要重新运行本脚本（快捷方式里记录了 pythonw.exe 的路径）。
 #>
@@ -108,6 +108,6 @@ if (-not (Get-WatcherProcess)) {
 }
 
 ""
-"已在后台启动，稳定在线时每 5 分钟、掉线时每 1 分钟巡检。"
+"已在后台启动，稳定在线时每 60 分钟、掉线时每 10 分钟巡检。"
 "查看日志： Get-Content -Tail 20 -Wait `"$logPath`""
 "环境自检： & `"$pyExe`" `"$scriptPy`" --diagnose"

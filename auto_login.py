@@ -45,7 +45,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # ---------------------------------------------------------------- 常量
 
@@ -78,8 +78,8 @@ CAMPUS_CIDR = "10.0.0.0/8"
 # 这些段永远不算校园网地址：Clash/Mihomo TUN(198.18/15)、CGNAT(100.64/10)、链路本地、回环
 EXCLUDED_NETS = ("198.18.0.0/15", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8")
 
-FAST_INTERVAL = 60        # 刚登录或刚异常时的巡检间隔（秒）
-SLOW_INTERVAL = 300       # 连续稳定在线后的巡检间隔（秒）
+FAST_INTERVAL = 600       # 掉线/异常时的巡检间隔（秒）
+SLOW_INTERVAL = 3600      # 连续稳定在线后的巡检间隔（秒）
 STABLE_CHECKS = 5         # 连续几次在线后降频
 DEFAULT_WAIT = 180        # 等网络就绪的最长秒数
 NET_POLL = 3.0            # 等网络时的轮询间隔
@@ -780,10 +780,16 @@ def do_logout(max_wait: int, campus_net, source_ip: str = "") -> int:
     return 0
 
 
+def _fmt_secs(value: int) -> str:
+    if value >= 120 and value % 60 == 0:
+        return f"{value // 60} 分钟"
+    return f"{value} 秒"
+
+
 def _sleep_with_wake_detection(delay: float) -> bool:
     """分片睡眠。检测到系统休眠恢复或时钟跳变时提前返回 True。
 
-    分片是为了在唤醒后立刻重新巡检，而不是傻等满一轮（最长 300 秒）。
+    分片是为了在唤醒后立刻重新巡检，而不是傻等满一轮（最长可达 1 小时）。
     """
     end = time.time() + max(0.0, delay)
     last = time.time()
@@ -811,7 +817,7 @@ def do_watch(args, campus_net) -> int:
 
     fast = max(10, args.interval)
     slow = max(fast, args.interval_slow)
-    log(f"巡检已启动 v{VERSION}：稳定在线时每 {slow}s，异常时每 {fast}s 检查一次")
+    log(f"巡检已启动 v{VERSION}：稳定在线时每 {_fmt_secs(slow)}，掉线/异常时每 {_fmt_secs(fast)} 检查一次")
 
     stable = 0
     while True:
