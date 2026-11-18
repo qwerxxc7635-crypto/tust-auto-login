@@ -45,7 +45,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 
 # ---------------------------------------------------------------- 常量
 
@@ -1061,8 +1061,14 @@ def main(argv=None) -> int:
         log(f"创建单实例互斥体失败：{exc}", "ERROR")
         return 1
     if handle is None:
-        log("已有实例在运行，本次退出")
-        return 0
+        if args.watch:
+            # 只挡"第二个巡检"，否则会两个进程互相抢登录
+            log("已有巡检实例在运行，本次退出")
+            return 0
+        # 手动执行一次不受互斥体阻挡：用户明确要求现在登录，
+        # 若被巡检占着锁就静默退出，会变成"命令跑完但什么都没发生"
+        log("检测到后台巡检正在运行，本次手动执行照常进行")
+        handle = None
 
     try:
         if args.watch:
@@ -1074,10 +1080,11 @@ def main(argv=None) -> int:
             pass
         return do_login(args.wait, campus_net, args.source_ip)
     finally:
-        try:
-            _k32.CloseHandle(ctypes.c_void_p(handle))
-        except Exception:  # noqa: BLE001
-            pass
+        if handle is not None:
+            try:
+                _k32.CloseHandle(ctypes.c_void_p(handle))
+            except Exception:  # noqa: BLE001
+                pass
 
 
 if __name__ == "__main__":
