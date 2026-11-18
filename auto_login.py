@@ -45,7 +45,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 # ---------------------------------------------------------------- 常量
 
@@ -502,23 +502,44 @@ def parse_json(text: str):
         return None
 
 
-def parse_online_list(text: str):
-    """返回 list（可能为空）表示解析成功；返回 None 表示读不懂（状态未知）。
+HTML_MARKS = ("<html", "<!doctype", "<script", "<meta ")
 
-    注意：有 JSON 但没有 list 字段，也按"读不懂"处理 —— 那是错误响应，
-    不能当成"没有会话"，否则会误判离线并重复认证。
-    """
+
+def parse_online_list(text: str):
+    """只负责从 JSONP 里取 list：返回 list 或 None（取不到）。"""
     data = parse_json(text)
     if not isinstance(data, dict):
         return None
-    if "list" not in data:
-        return None
     items = data.get("list")
-    if items is None:
-        return []
-    if not isinstance(items, list):
-        return None
-    return items
+    return items if isinstance(items, list) else None
+
+
+def classify_probe(raw_text: str, ip: str):
+    """把 online_list 的返回归一成三态。
+
+    实测：未认证时网关不会返回 JSONP，而是把这个接口请求改写成登录页 HTML。
+    早先的实现把"没有 list"一律当成"读不懂"，结果未登录时被判成"状态未知"，
+    于是开机该登录时反而不登录 —— 这里按返回形态区分。
+    """
+    data = parse_json(raw_text)
+    answered = "dr1019(" in (raw_text or "")
+
+    if answered and isinstance(data, dict):
+        items = data.get("list")
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and str(item.get("online_ip", "")) == ip:
+                    return ST_ONLINE, item
+            return ST_OFFLINE, None
+        # 接口正常作答但没有 list 字段：查不到会话
+        return ST_OFFLINE, None
+
+    low = (raw_text or "")[:512].lower()
+    if any(mark in low for mark in HTML_MARKS):
+        # 门户把请求改写成登录页 = 当前未认证
+        return ST_OFFLINE, None
+
+    return ST_UNKNOWN, None
 
 
 def account_local(value: str) -> str:
@@ -610,14 +631,11 @@ def probe(portal: Portal, ip: str):
     except Exception as exc:  # noqa: BLE001
         log(f"读取在线列表失败：{exc}", "WARN")
         return ST_UNKNOWN, None
-    items = parse_online_list(text)
-    if items is None:
-        log("在线列表无法解析（网关返回了异常内容），本轮状态未知", "WARN")
-        return ST_UNKNOWN, None
-    for item in items:
-        if isinstance(item, dict) and str(item.get("online_ip", "")) == ip:
-            return ST_ONLINE, item
-    return ST_OFFLINE, None
+    state, session = classify_probe(text, ip)
+    if state == ST_UNKNOWN:
+        snippet = " ".join((text or "").split())[:120]
+        log(f"在线列表无法判定（网关返回：{snippet or '空'}），本轮状态未知", "WARN")
+    return state, session
 
 
 def detect_current_session(campus_net):
