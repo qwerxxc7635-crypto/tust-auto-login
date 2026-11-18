@@ -6,21 +6,23 @@
 #
 """TUST 校园网自动登录（无头版，无 GUI 依赖）
 
-协议实现参考 gethub-15/TUST-Campus-Network-Auto-Login----Android-and-Windows- 的
-Windows 版（Dr.COM eportal 网页认证），去掉了 tkinter 界面，改为可开机自动执行。
+Dr.COM eportal 网页认证的无人值守实现：开机自启、在线不打扰、掉线自动重连。
+
+协议细节（接口路径、user_account 的 ",0," 前缀、运营商后缀、wlan_user_ip 的取法）
+来自对校园网门户页面及其脚本的观察，并参考了同校开源项目；本文件为独立重写。
 
 用法：
-    python auto_login.py --setup      # 首次配置：录入学号/密码/联网方式，DPAPI 加密保存
-    python auto_login.py --status     # 只看状态，不登录
-    python auto_login.py              # 执行一次：未在线才登录
-    python auto_login.py --watch      # 常驻：每 5 分钟巡检一次（开机自启用这个）
-    python auto_login.py --logout     # 注销当前设备
+    python auto_login.py --setup       # 首次配置：录入学号/密码/联网方式（DPAPI 加密保存）
+    python auto_login.py --diagnose    # 环境自检：IP 选择、代理、网关、Clash/TUN 状态
+    python auto_login.py --status      # 只看状态，不登录
+    python auto_login.py               # 执行一次：未在线才登录
+    python auto_login.py --watch       # 常驻巡检（开机自启用这个）
+    python auto_login.py --logout      # 注销当前设备，并暂停自动登录
+    python auto_login.py --resume      # 恢复自动登录
 
 退出码：
-    0 成功 / 已在线        1 登录失败        2 未配置账号
-    3 在线但不是当前账号    4 网络未就绪
-
-注意：本脚本只把账号密码提交给校园网认证服务器（10.10.102.50），不访问任何第三方。
+    0 成功 / 已在线 / 已暂停    1 登录失败或状态未知    2 未配置账号
+    3 在线但不是当前账号        4 网络未就绪            5 需要人工处理（密码或上网方式错误）
 """
 
 from __future__ import annotations
@@ -35,18 +37,22 @@ import re
 import socket
 import sys
 import time
+import traceback
 from datetime import datetime
 from http.cookiejar import CookieJar
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
-from urllib.request import HTTPCookieProcessor, Request, build_opener
+from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
+
+VERSION = "1.1.0"
 
 # ---------------------------------------------------------------- 常量
 
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "TustAutoLogin"
 CRED_PATH = APP_DIR / "cred.dat"
 LOG_PATH = APP_DIR / "auto-login.log"
+PAUSE_PATH = APP_DIR / "paused"
 LOG_MAX_BYTES = 512 * 1024
 
 GATEWAY_HOST = "10.10.102.50"
@@ -65,20 +71,42 @@ OPERATORS = [
     ("中国电信", "@telecom"),
 ]
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TUST-AutoLogin/1.0"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TUST-AutoLogin/1.1"
 
-DEFAULT_INTERVAL = 300   # 巡检间隔（秒）
-DEFAULT_WAIT = 180       # 等网络就绪的最长时间（秒）
-NET_POLL = 3.0           # 等网络时的轮询间隔（秒）
+# 校园网内网段：用来排除 Clash/VPN 的虚拟网卡地址。若你校网不是 10/8，用 --campus-cidr 覆盖。
+CAMPUS_CIDR = "10.0.0.0/8"
+# 这些段永远不算校园网地址：Clash/Mihomo TUN(198.18/15)、CGNAT(100.64/10)、链路本地、回环
+EXCLUDED_NETS = ("198.18.0.0/15", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8")
 
-LOGIN_OK_MARKS = ("协议认证成功", '"result":"1"', "认证成功")
-LOGIN_ALREADY_MARKS = ("已经在网", "已在网", "already online", '"ret_code":2', '"ret_code": "2"')
+FAST_INTERVAL = 60        # 刚登录或刚异常时的巡检间隔（秒）
+SLOW_INTERVAL = 300       # 连续稳定在线后的巡检间隔（秒）
+STABLE_CHECKS = 5         # 连续几次在线后降频
+DEFAULT_WAIT = 180        # 等网络就绪的最长秒数
+NET_POLL = 3.0            # 等网络时的轮询间隔
+BLIND_AFTER = 3           # 连续读不到状态多少轮后，允许盲登一次
+BLIND_COOLDOWN = 3600.0   # 两次盲登的最小间隔（秒）
+SLEEP_CHUNK = 5.0         # 分片睡眠粒度，用于检测休眠唤醒
+
 PASSWORD_ERROR_MARKS = ("统一身份认证密码错误", "密码错误", "password error")
 DOMAIN_ERROR_MARKS = ("domain error",)
 
+ST_UNKNOWN = -1
+ST_OFFLINE = 0
+ST_ONLINE = 1
+
 QUIET = False
+_last_state = None
+_unknown_streak = 0
+_last_blind = 0.0
 
 # ---------------------------------------------------------------- 日志
+
+_SECRET_RE = re.compile(r"((?:user_)?password=)([^&\s\"']+)", re.IGNORECASE)
+
+
+def _redact(text: str) -> str:
+    """兜底脱敏：任何情况下都不让 URL 里的密码进日志。"""
+    return _SECRET_RE.sub(r"\1***", str(text))
 
 
 def _log_rotate() -> None:
@@ -93,12 +121,11 @@ def _log_rotate() -> None:
 
 
 def log(message: str, level: str = "INFO") -> None:
-    """写日志文件；非 --quiet 且有控制台时同时打印。"""
-    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} [{level}] {message}"
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} [{level}] {_redact(message)}"
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         _log_rotate()
-        # 首次创建时带 BOM：这样 PowerShell 5.1 的 Get-Content 和记事本都能正确显示中文
+        # 首次创建带 BOM：PowerShell 5.1 的 Get-Content 和记事本都能正确显示中文
         new_file = not LOG_PATH.exists()
         with open(LOG_PATH, "a", encoding="utf-8-sig" if new_file else "utf-8") as fh:
             fh.write(line + "\n")
@@ -174,39 +201,82 @@ def dpapi_unprotect(data: bytes) -> bytes:
 
 
 def save_creds(account: str, password: str, operator: str) -> None:
+    """原子写入，避免巡检正好读到写了一半的文件。"""
     payload = json.dumps(
         {"v": 1, "account": account, "password": password, "operator": operator},
         ensure_ascii=False,
     ).encode("utf-8")
+    blob = dpapi_protect(payload)
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    CRED_PATH.write_bytes(dpapi_protect(payload))
-    try:  # 仅当前用户的 ACL（尽力而为，失败不影响功能）
-        os.chmod(CRED_PATH, 0o600)
-    except OSError:
-        pass
+    tmp = CRED_PATH.with_name(CRED_PATH.name + ".tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(blob)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, CRED_PATH)
 
 
-def load_creds() -> dict | None:
+def load_creds_checked():
+    """返回 (creds, error)。
+
+    creds 为 None 且 error 为 None → 从未配置；
+    creds 为 None 且 error 有值 → 文件在但读不了（DPAPI/权限/内容问题），不要当成"未配置"。
+    """
     if not CRED_PATH.exists():
-        return None
+        return None, None
     try:
-        data = json.loads(dpapi_unprotect(CRED_PATH.read_bytes()).decode("utf-8"))
-    except Exception:
-        return None
-    if not data.get("account") or not data.get("password"):
-        return None
-    return data
+        raw = CRED_PATH.read_bytes()
+    except OSError as exc:
+        return None, f"读取 {CRED_PATH.name} 失败：{exc}"
+    try:
+        data = json.loads(dpapi_unprotect(raw).decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001  DPAPI 的 WinError 也是 OSError，一并记录
+        return None, f"解密失败（换过 Windows 账户或重置过密码会导致此错误）：{type(exc).__name__}: {exc}"
+    if not isinstance(data, dict) or not data.get("account") or not data.get("password"):
+        return None, "凭据内容不完整"
+    return data, None
 
 
-# ---------------------------------------------------------------- 网络探测
+def load_creds():
+    return load_creds_checked()[0]
+
+
+# ---------------------------------------------------------------- 本机地址选择
+
+
+def _parse_net(value: str, default: str):
+    try:
+        return ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return ipaddress.ip_network(default)
+
+
+def _excluded_nets():
+    return tuple(ipaddress.ip_network(n) for n in EXCLUDED_NETS)
+
+
+def campus_net_of(value: str = ""):
+    return _parse_net(value or CAMPUS_CIDR, CAMPUS_CIDR)
+
+
+def classify_ip(ip: str, campus_net):
+    """(是否可作校园网源地址, 原因)"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False, "非法地址"
+    if addr.version != 4:
+        return False, "不是 IPv4"
+    for net in _excluded_nets():
+        if addr in net:
+            return False, f"{net} 是虚拟网卡/保留网段"
+    if addr not in campus_net:
+        return False, f"不在校园网段 {campus_net}"
+    return True, ""
 
 
 def gateway_source_ip() -> str:
-    """本机访问校园网关时会使用的源地址。
-
-    直接问「到网关走哪条路由」，比问 8.8.8.8 更准：
-    装了 VPN/虚拟网卡时，8.8.8.8 可能落到虚拟网卡上而拿到错误地址。
-    """
+    """系统路由表认为访问网关时会用的源地址（UDP connect 不发包，只查路由）。"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(2.0)
     try:
@@ -218,14 +288,60 @@ def gateway_source_ip() -> str:
         sock.close()
 
 
-def is_campus_ip(ip: str) -> bool:
+def ipv4_candidates() -> list:
+    found: list = []
     try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return False
-    if addr.version != 4:
-        return False
-    return addr.is_private and not addr.is_loopback and not addr.is_link_local
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip not in found:
+                found.append(ip)
+    except OSError:
+        pass
+    route_ip = gateway_source_ip()
+    if route_ip and route_ip not in found:
+        found.append(route_ip)
+    return found
+
+
+def pick_source_ip(campus_net, override: str = ""):
+    """挑出该提交给网关的本机 IPv4。
+
+    不直接用「到网关的路由源地址」，因为 Clash TUN 会把 10.x 也劫持进 198.18/15，
+    那样提交上去的 wlan_user_ip 就是 TUN 地址，认证必然失败。
+    """
+    if override:
+        ok, why = classify_ip(override, campus_net)
+        if ok:
+            return override, "手动指定（--source-ip）"
+        return "", f"--source-ip {override} 不可用：{why}"
+
+    route_ip = gateway_source_ip()
+    cands = ipv4_candidates()
+    good = [ip for ip in cands if classify_ip(ip, campus_net)[0]]
+
+    if len(good) == 1:
+        note = "自动识别"
+        if route_ip and route_ip != good[0]:
+            note = f"自动识别（路由出口是 {route_ip}，已改用 {good[0]}）"
+        return good[0], note
+    if len(good) > 1:
+        if route_ip in good:
+            return route_ip, "多个候选地址，取路由出口那个"
+        good.sort()
+        return good[0], f"多个候选地址 {good}，取第一个（可用 --source-ip 指定）"
+
+    if route_ip:
+        ok, why = classify_ip(route_ip, campus_net)
+        if not ok:
+            hint = ""
+            if any(ipaddress.ip_address(route_ip) in n for n in _excluded_nets()):
+                hint = "；检测到 Clash/VPN 的 TUN 虚拟网卡抢占了路由，请在 Clash 里把校园网段设为 DIRECT，或关闭 TUN，或用 --source-ip 指定"
+            return "", f"出口地址 {route_ip} 不可用（{why}）{hint}"
+    return "", "未找到校园网内网地址（是否还没连上校园 Wi-Fi？）"
+
+
+def is_campus_ip(ip: str, campus_net=None) -> bool:
+    return classify_ip(ip, campus_net or campus_net_of())[0]
 
 
 def tcp_reachable(host: str, port: int, timeout: float = 2.0) -> bool:
@@ -248,26 +364,21 @@ def local_ipv6() -> str:
     return ""
 
 
-def wait_for_network(max_wait: int) -> str:
-    """循环等到「拿到校园网内网 IP 且网关可达」，返回 IP；超时返回空串。"""
+def wait_for_network(max_wait: int, campus_net, source_ip: str = ""):
+    """等「拿到校园网地址 + 网关可达」，返回 (ip, 说明) 或 ("", 原因)。"""
     deadline = time.monotonic() + max(1, max_wait)
-    last_reason = "尚未获取到 IPv4 地址"
+    reason = "尚未就绪"
     while True:
-        ip = gateway_source_ip()
-        if not ip:
-            last_reason = "尚未获取到 IPv4 地址（网卡可能还没连上 Wi-Fi）"
-        elif not is_campus_ip(ip):
-            last_reason = (
-                f"本机出口地址是 {ip}，不属于校园网内网段"
-                "（通常是有 VPN / 虚拟网卡抢占了默认路由）"
-            )
-        elif not tcp_reachable(GATEWAY_HOST, GATEWAY_PORT):
-            last_reason = f"校园网关 {GATEWAY_HOST}:{GATEWAY_PORT} 不可达"
+        ip, note = pick_source_ip(campus_net, source_ip)
+        if ip:
+            if tcp_reachable(GATEWAY_HOST, GATEWAY_PORT):
+                return ip, note
+            reason = f"网关 {GATEWAY_HOST}:{GATEWAY_PORT} 不可达"
         else:
-            return ip
+            reason = note
         if time.monotonic() >= deadline:
-            log(f"等待网络就绪超时（{max_wait}s）：{last_reason}", "WARN")
-            return ""
+            log(f"等待网络就绪超时（{max_wait}s）：{reason}", "WARN")
+            return "", reason
         time.sleep(NET_POLL)
 
 
@@ -324,12 +435,8 @@ def logout_url(ip: str) -> str:
 
 def online_list_url(ip: str) -> str:
     try:
-        num = str(
-            (int(ip.split(".")[0]) << 24)
-            + (int(ip.split(".")[1]) << 16)
-            + (int(ip.split(".")[2]) << 8)
-            + int(ip.split(".")[3])
-        )
+        parts = [int(p) for p in ip.split(".")]
+        num = str(((parts[0] << 24) + (parts[1] << 16) + (parts[2] << 8) + parts[3]) & 0xFFFFFFFF)
     except (ValueError, IndexError):
         num = "0"
     params = {
@@ -347,8 +454,15 @@ def online_list_url(ip: str) -> str:
 
 
 class Portal:
+    """所有请求都强制直连：绝不走系统代理。
+
+    urllib 的 build_opener() 默认会装 ProxyHandler，Windows 上读的是 IE 设置。
+    一旦系统代理开着且绕过列表没覆盖网关，请求会带着明文密码进代理进程，
+    而本地 TCP 探测却是直连的 —— 报错会非常难懂。
+    """
+
     def __init__(self) -> None:
-        self.opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        self.opener = build_opener(ProxyHandler({}), HTTPCookieProcessor(CookieJar()))
 
     def get(self, url: str, timeout: float = 10.0) -> str:
         req = Request(url, headers={"User-Agent": UA})
@@ -363,10 +477,7 @@ class Portal:
 
 
 def decode_body(raw: bytes) -> str:
-    """Dr.COM 门户页是 gb2312，接口是 utf-8/jsonp，按顺序试。
-
-    用错编码会让「注销页/认证成功」这类中文关键字全部匹配不上。
-    """
+    """门户页是 gb2312，接口是 utf-8/jsonp，按顺序试。用错编码会让中文关键字全部失效。"""
     for encoding in ("utf-8", "gb18030"):
         try:
             return raw.decode(encoding)
@@ -375,13 +486,42 @@ def decode_body(raw: bytes) -> str:
     return raw.decode("utf-8", "replace")
 
 
-ACCOUNT_RE = re.compile(
-    r'"(?:user_account|userAccount|userName|userIdNumber|user_name)"\s*:\s*"([^"]*)"'
-)
+# ---------------------------------------------------------------- 解析与判定
+
+
+def parse_json(text: str):
+    """从 JSONP（dr1019({...})）或纯 JSON 里取出第一个对象。"""
+    if not text:
+        return None
+    match = re.search(r"\{.*\}", text, re.S)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except ValueError:
+        return None
+
+
+def parse_online_list(text: str):
+    """返回 list（可能为空）表示解析成功；返回 None 表示读不懂（状态未知）。
+
+    注意：有 JSON 但没有 list 字段，也按"读不懂"处理 —— 那是错误响应，
+    不能当成"没有会话"，否则会误判离线并重复认证。
+    """
+    data = parse_json(text)
+    if not isinstance(data, dict):
+        return None
+    if "list" not in data:
+        return None
+    items = data.get("list")
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        return None
+    return items
 
 
 def account_local(value: str) -> str:
-    """把 `23083214@unicom` 归一成 `23083214`。"""
     return (value or "").split("@")[0].strip()
 
 
@@ -410,46 +550,49 @@ def operator_from_account(value: str) -> str:
     return ""
 
 
-def parse_online_list(text: str) -> list:
-    """解析 dr1019({...}) 形式的在线设备列表。"""
-    match = re.search(r"\{.*\}", text or "", re.S)
-    if not match:
-        return []
-    try:
-        data = json.loads(match.group(0))
-    except ValueError:
-        return []
-    items = data.get("list")
-    return items if isinstance(items, list) else []
-
-
 def _contains(text: str, marks) -> bool:
     return any(m in (text or "") for m in marks)
 
 
-def is_accepted(text: str) -> bool:
-    return _contains(text, LOGIN_OK_MARKS)
+def message_of(raw: str) -> str:
+    data = parse_json(raw)
+    if isinstance(data, dict):
+        for key in ("msg", "message", "info"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
 
 
-def is_already_online(text: str) -> bool:
-    return _contains(text, LOGIN_ALREADY_MARKS)
-
-
-def is_current_account(text: str, account: str) -> bool:
-    """兼容旧调用：在整段文本里找该学号对应的账号字段。"""
-    if not text or not account:
-        return False
-    for match in ACCOUNT_RE.finditer(text):
-        if same_account(match.group(1), account):
-            return True
-    return False
+def classify_login_result(raw: str):
+    """返回 (verdict, detail)。verdict ∈ ok / already / permanent / fail。"""
+    data = parse_json(raw)
+    message = message_of(raw)
+    if isinstance(data, dict):
+        if str(data.get("result")) == "1" or "认证成功" in message:
+            return "ok", message
+        ret = data.get("ret_code")
+        # 精确比较：原实现用子串匹配 "ret_code":2，会误中 20~29
+        if ret in (2, "2") or "已经在网" in message or "已在网" in message:
+            return "already", message
+    text = raw or ""
+    if _contains(text, ("协议认证成功", "认证成功")):
+        return "ok", message
+    if _contains(text, ("已经在网", "已在网", "already online")):
+        return "already", message
+    if _contains(text, PASSWORD_ERROR_MARKS) or _contains(text, DOMAIN_ERROR_MARKS):
+        return "permanent", explain_failure(text)
+    return "fail", explain_failure(text)
 
 
 def explain_failure(text: str) -> str:
     if _contains(text, PASSWORD_ERROR_MARKS):
         return "密码错误（统一身份认证未通过）"
     if _contains(text, DOMAIN_ERROR_MARKS):
-        return "上网方式选择错误（联通/移动/电信后缀与账号不匹配）"
+        return "上网方式选择错误（运营商后缀与账号不匹配）"
+    message = message_of(text)
+    if message:
+        return message[:160]
     compact = " ".join((text or "").split())
     if not compact:
         return "网关没有返回任何内容（可能是网络中断或网关异常）"
@@ -457,42 +600,34 @@ def explain_failure(text: str) -> str:
 
 
 def probe(portal: Portal, ip: str):
-    """查本机在网关上的会话。
+    """返回 (状态, 会话)。三态：在线 / 离线 / 读不懂。
 
-    返回 (session 或 None, 门户页文本)。session 是本机这个 IP 的在线记录，
-    不是「网关上有没有别的设备在线」——这一点很关键，否则会重复认证自踢。
+    只打一个请求（在线列表），它已经包含本机 IP、账号、上线时间，
+    门户页那个判据实测在线时也不含关键字，没有价值，已移除。
     """
-    page = ""
-    items: list = []
     try:
-        page = portal.get(portal_page_url(ip), 8)
-    except Exception as exc:  # noqa: BLE001
-        log(f"读取门户页失败：{exc}", "WARN")
-    try:
-        items = parse_online_list(portal.get(online_list_url(ip), 8))
+        text = portal.get(online_list_url(ip), 8)
     except Exception as exc:  # noqa: BLE001
         log(f"读取在线列表失败：{exc}", "WARN")
-
+        return ST_UNKNOWN, None
+    items = parse_online_list(text)
+    if items is None:
+        log("在线列表无法解析（网关返回了异常内容），本轮状态未知", "WARN")
+        return ST_UNKNOWN, None
     for item in items:
-        if str(item.get("online_ip", "")) == ip:
-            return item, page
-
-    if not items and ("olflow=" in page or "注销页" in page):
-        # 在线列表读不到时用门户页兜底；宁可这一轮不动，也不要重复认证把设备踢掉
-        return {"user_account": "", "_fallback": True}, page
-    return None, page
+        if isinstance(item, dict) and str(item.get("online_ip", "")) == ip:
+            return ST_ONLINE, item
+    return ST_OFFLINE, None
 
 
-def detect_current_session():
-    """当前是否已经在线；setup 时用来预填账号和上网方式。"""
-    ip = gateway_source_ip()
-    if not ip or not is_campus_ip(ip):
-        return None
-    if not tcp_reachable(GATEWAY_HOST, GATEWAY_PORT):
+def detect_current_session(campus_net):
+    """当前是否已经在线；--setup 时用来预填账号和上网方式。"""
+    ip, _ = pick_source_ip(campus_net)
+    if not ip or not tcp_reachable(GATEWAY_HOST, GATEWAY_PORT):
         return None
     try:
-        session, _ = probe(Portal(), ip)
-        return session
+        state, session = probe(Portal(), ip)
+        return session if state == ST_ONLINE else None
     except Exception:  # noqa: BLE001
         return None
 
@@ -500,54 +635,108 @@ def detect_current_session():
 # ---------------------------------------------------------------- 业务流程
 
 
-def do_login(max_wait: int) -> int:
-    creds = load_creds()
-    if not creds:
+def _cred_stamp() -> int:
+    try:
+        return CRED_PATH.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _state_changed(state) -> bool:
+    global _last_state
+    changed = state != _last_state
+    _last_state = state
+    return changed
+
+
+def do_login(max_wait: int, campus_net, source_ip: str = "") -> int:
+    global _unknown_streak, _last_blind
+
+    creds, cred_err = load_creds_checked()
+    if creds is None and cred_err is None:
         log("尚未配置账号，请先运行： python auto_login.py --setup", "ERROR")
         return 2
+    if creds is None:
+        log(f"凭据读不了：{cred_err}", "ERROR")
+        return 1
 
-    ip = wait_for_network(max_wait)
+    if PAUSE_PATH.exists():
+        log("已手动注销，自动登录暂停（--resume 恢复）")
+        return 0
+
+    ip, note = wait_for_network(max_wait, campus_net, source_ip)
     if not ip:
         return 4
 
     portal = Portal()
-    session, _page = probe(portal, ip)
+    state, session = probe(portal, ip)
 
-    if session:
+    if state == ST_ONLINE:
+        _unknown_streak = 0
         online = str(session.get("user_account", ""))
         if online and same_account(online, creds["account"]):
-            log(f"已在线（{mask_account(online)}，IP {ip}），无需登录")
+            if _state_changed("online"):
+                log(f"已在线（{mask_account(online)}，IP {ip}），无需登录")
             return 0
-        log(
-            f"IP {ip} 上已有会话（{mask_account(online) or '账号未知'}），"
-            "为避免互踢，本次不发起登录",
-            "WARN",
-        )
+        if _state_changed("other"):
+            log(
+                f"IP {ip} 上已有会话（{mask_account(online) or '账号未知'}），"
+                "为避免互踢，本次不发起登录",
+                "WARN",
+            )
         return 3
 
+    if state == ST_UNKNOWN:
+        _unknown_streak += 1
+        now = time.time()
+        if _unknown_streak < BLIND_AFTER or now - _last_blind < BLIND_COOLDOWN:
+            _state_changed("unknown")
+            log(f"无法确认在线状态（连续 {_unknown_streak} 次），本轮不登录", "WARN")
+            return 1
+        _last_blind = now
+        log(f"连续 {_unknown_streak} 次读不到状态，放行一次登录尝试", "WARN")
+    else:
+        _unknown_streak = 0
+
+    if _state_changed("offline"):
+        log(f"未登录（IP {ip}，{note}），开始认证")
+
     try:
-        result = portal.get(login_url(ip, creds["account"], creds["password"], creds["operator"]), 12)
+        raw = portal.get(
+            login_url(ip, creds["account"], creds["password"], creds["operator"]), 12
+        )
     except Exception as exc:  # noqa: BLE001
         log(f"登录请求失败：{exc}", "ERROR")
         return 1
 
-    if is_accepted(result):
+    verdict, detail = classify_login_result(raw)
+    if verdict == "ok":
         log(f"登录成功（{mask_account(creds['account'])}，IP {ip}）")
+        _last_state = "online"
         return 0
-    if is_already_online(result):
-        log("账号已在其他设备在线，网关跳过了本次认证")
-        return 0
+    if verdict == "already":
+        # 二次确认：网关说"已在别处在线"，但本机到底通没通，要看在线列表
+        state2, session2 = probe(portal, ip)
+        if state2 == ST_ONLINE and same_account(str(session2.get("user_account", "")), creds["account"]):
+            log(f"账号已在网关在线，本机 IP {ip} 已确认可用")
+            _last_state = "online"
+            return 0
+        log("网关提示账号已在其它设备在线，但本机没有会话；按失败处理并退避", "WARN")
+        return 1
+    if verdict == "permanent":
+        log(f"登录失败：{detail}。已停止自动重试，请用 --setup 修正账号/密码/上网方式", "ERROR")
+        return 5
 
-    log(f"登录失败：{explain_failure(result)}", "ERROR")
+    log(f"登录失败：{detail}", "ERROR")
     return 1
 
 
-def do_status(max_wait: int) -> int:
-    ip = wait_for_network(max_wait)
+def do_status(max_wait: int, campus_net, source_ip: str = "") -> int:
+    ip, note = wait_for_network(min(max_wait, 30), campus_net, source_ip)
     if not ip:
         return 4
-    session, _page = probe(Portal(), ip)
-    if session:
+    state, session = probe(Portal(), ip)
+    if state == ST_ONLINE:
         online = str(session.get("user_account", ""))
         log(f"状态：已在线（{mask_account(online) or '账号未知'}，IP {ip}）")
         if session.get("online_time"):
@@ -558,14 +747,18 @@ def do_status(max_wait: int) -> int:
         creds = load_creds()
         if creds and online and not same_account(online, creds["account"]):
             log(f"      注意：在线账号与已配置的 {creds['account']} 不一致", "WARN")
+    elif state == ST_UNKNOWN:
+        log(f"状态：无法确认（IP {ip}）")
     else:
         log(f"状态：未登录（IP {ip}）")
+    if PAUSE_PATH.exists():
+        log("      自动登录处于暂停状态（--resume 恢复）")
     log(f"日志文件：{LOG_PATH}")
     return 0
 
 
-def do_logout(max_wait: int) -> int:
-    ip = wait_for_network(max_wait)
+def do_logout(max_wait: int, campus_net, source_ip: str = "") -> int:
+    ip, _ = wait_for_network(min(max_wait, 60), campus_net, source_ip)
     if not ip:
         return 4
     try:
@@ -573,64 +766,180 @@ def do_logout(max_wait: int) -> int:
     except Exception as exc:  # noqa: BLE001
         log(f"注销请求失败：{exc}", "ERROR")
         return 1
+    # 注销后必须暂停自动登录，否则下一轮巡检会立刻把你重新登上去
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        PAUSE_PATH.write_text(str(time.time()), encoding="utf-8")
+    except OSError as exc:
+        log(f"写入暂停标记失败：{exc}", "WARN")
     if _contains(result, ("注销成功", '"result":"1"', "上网登录页")):
-        log(f"已注销（IP {ip}）")
+        log(f"已注销（IP {ip}），自动登录已暂停；--resume 恢复")
         return 0
     log(f"注销结果未确认：{' '.join(result.split())[:120]}", "WARN")
+    log("已暂停自动登录；--resume 恢复")
     return 0
 
 
-def do_watch(args) -> int:
-    if not load_creds():
+def _sleep_with_wake_detection(delay: float) -> bool:
+    """分片睡眠。检测到系统休眠恢复或时钟跳变时提前返回 True。
+
+    分片是为了在唤醒后立刻重新巡检，而不是傻等满一轮（最长 300 秒）。
+    """
+    end = time.time() + max(0.0, delay)
+    last = time.time()
+    while True:
+        remain = end - time.time()
+        if remain <= 0:
+            return False
+        time.sleep(min(remain, SLEEP_CHUNK))
+        cur = time.time()
+        if cur - last > SLEEP_CHUNK * 6:
+            return True
+        if cur < last:
+            return True
+        last = cur
+
+
+def do_watch(args, campus_net) -> int:
+    if not CRED_PATH.exists():
         log("尚未配置账号，巡检不启动。请先运行： python auto_login.py --setup", "ERROR")
         return 2
-    log(f"巡检已启动：每 {args.interval}s 检查一次")
+    try:
+        PAUSE_PATH.unlink()
+    except OSError:
+        pass
+
+    fast = max(10, args.interval)
+    slow = max(fast, args.interval_slow)
+    log(f"巡检已启动 v{VERSION}：稳定在线时每 {slow}s，异常时每 {fast}s 检查一次")
+
+    stable = 0
     while True:
         try:
-            code = do_login(args.wait)
+            code = do_login(args.wait, campus_net, args.source_ip)
         except KeyboardInterrupt:
             log("收到退出信号，巡检结束")
             return 0
-        except Exception as exc:  # noqa: BLE001
-            log(f"巡检异常：{exc}", "ERROR")
+        except Exception:  # noqa: BLE001
+            log("巡检异常：\n" + traceback.format_exc(), "ERROR")
             code = 1
+
         if code == 2:
             log("账号配置已丢失，停止巡检")
             return 2
-        # 失败时更快重试（校园网偶尔抽风，30s 后再试一次）
-        delay = args.interval if code == 0 else min(30, args.interval)
+
+        if code == 5:
+            # 密码错 / 上网方式错：重试只会累积失败次数，等凭据更新
+            stamp = _cred_stamp()
+            log(f"需要人工处理，已停止访问网关；重新运行 --setup 后自动恢复（监视 {CRED_PATH.name}）", "ERROR")
+            while _cred_stamp() == stamp:
+                time.sleep(60)
+            stable = 0
+            continue
+
+        if code == 0:
+            stable = min(stable + 1, STABLE_CHECKS)
+        else:
+            stable = 0
+
+        if code == 3:
+            delay = max(slow, 300)
+        elif code == 0 and stable >= STABLE_CHECKS:
+            delay = slow
+        else:
+            delay = fast
+
         try:
-            time.sleep(delay)
+            if _sleep_with_wake_detection(delay):
+                log("检测到系统休眠恢复或时钟跳变，立即重新检查", "INFO")
         except KeyboardInterrupt:
             log("收到退出信号，巡检结束")
             return 0
 
 
-# ---------------------------------------------------------------- 单实例 & 配置
+# ---------------------------------------------------------------- 单实例
 
 
 def acquire_mutex():
-    """防止多个实例同时登录把彼此踢下线。返回句柄，None 表示已有实例。"""
+    """返回句柄；None 表示已有实例在跑；创建失败直接抛错（不要冒充"已有实例"）。"""
     _k32.CreateMutexW.restype = ctypes.c_void_p
     _k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
     handle = _k32.CreateMutexW(None, 0, "Local\\TustAutoLogin")
+    err = ctypes.get_last_error()
     if not handle:
-        return None
-    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        raise ctypes.WinError(err)
+    if err == 183:  # ERROR_ALREADY_EXISTS
         _k32.CloseHandle(ctypes.c_void_p(handle))
         return None
     return handle
 
 
-def cmd_setup() -> int:
+# ---------------------------------------------------------------- 自检
+
+
+def do_diagnose(campus_net, source_ip: str = "") -> int:
+    import urllib.request as _ur
+
+    log(f"===== 环境自检 v{VERSION} =====")
+    log(f"Python      : {sys.version.split()[0]}  ({sys.executable})")
+    log(f"脚本        : {Path(__file__).resolve()}")
+    log(f"数据目录    : {APP_DIR}")
+
+    creds, err = load_creds_checked()
+    if creds:
+        log(f"凭据        : 正常（{mask_account(creds['account'])}，{creds.get('operator', '?')}）")
+    elif err:
+        log(f"凭据        : 无法读取 —— {err}", "WARN")
+    else:
+        log("凭据        : 未配置（先运行 --setup）", "WARN")
+    log(f"暂停标记    : {'存在（已暂停）' if PAUSE_PATH.exists() else '无'}")
+
+    log(f"校园网段    : {campus_net}")
+    route_ip = gateway_source_ip()
+    ok, why = classify_ip(route_ip, campus_net) if route_ip else (False, "无")
+    log(f"路由出口 IP : {route_ip or '(无)'} → {'可用' if ok else '不可用：' + why}", "INFO" if ok else "WARN")
+    for cand in ipv4_candidates():
+        cok, cwhy = classify_ip(cand, campus_net)
+        log(f"  候选地址  : {cand:16} {'可用' if cok else '不可用（' + cwhy + '）'}")
+    chosen, note = pick_source_ip(campus_net, source_ip)
+    log(f"选定源地址  : {chosen or '(无)'}  {note}", "INFO" if chosen else "ERROR")
+
+    proxies = _ur.getproxies()
+    log(f"系统代理    : {proxies or '无'}")
+    if proxies:
+        log(
+            f"              网关是否绕过代理：{'是' if _ur.proxy_bypass(GATEWAY_HOST) else '否'}"
+            "（本工具始终强制直连，不受影响）"
+        )
+    log(f"网关 TCP    : {'可达' if tcp_reachable(GATEWAY_HOST, GATEWAY_PORT) else '不可达'}")
+
+    if chosen:
+        state, session = probe(Portal(), chosen)
+        if state == ST_ONLINE:
+            log(f"门户状态    : 已在线（{mask_account(str(session.get('user_account', ''))) or '账号未知'}）")
+        elif state == ST_UNKNOWN:
+            log("门户状态    : 无法确认（在线列表读不懂）", "WARN")
+        else:
+            log("门户状态    : 未登录")
+    try:
+        size = LOG_PATH.stat().st_size
+        log(f"日志        : {LOG_PATH}（{size} 字节）")
+    except OSError:
+        log(f"日志        : {LOG_PATH}（尚未创建）")
+    return 0
+
+
+# ---------------------------------------------------------------- 配置
+
+
+def cmd_setup(campus_net) -> int:
     print("== TUST 校园网自动登录 · 首次配置 ==")
     print("账号密码用 Windows DPAPI 加密后保存到：")
     print(f"  {CRED_PATH}")
     print("（只有当前 Windows 用户能解密，复制到别的电脑或账户都用不了）")
     print()
 
-    # 如果此刻已经在线，直接用网关上的信息预填，回车即用
-    session = detect_current_session() or {}
+    session = detect_current_session(campus_net) or {}
     hint_raw = str(session.get("user_account", ""))
     hint_account = account_local(hint_raw)
     hint_operator = operator_from_account(hint_raw)
@@ -654,11 +963,11 @@ def cmd_setup() -> int:
         return 2
 
     print("\n上网方式：")
-    for i, (name, _) in enumerate(OPERATORS, 1):
+    for i, (name, _suffix) in enumerate(OPERATORS, 1):
         print(f"  {i}. {name}")
     default_index = 1
     if hint_operator:
-        for i, (name, _) in enumerate(OPERATORS, 1):
+        for i, (name, _suffix) in enumerate(OPERATORS, 1):
             if name == hint_operator:
                 default_index = i
     hint = f"，直接回车默认 {default_index}（{OPERATORS[default_index - 1][0]}）"
@@ -670,49 +979,80 @@ def cmd_setup() -> int:
         operator = OPERATORS[default_index - 1][0]
 
     save_creds(account, password, operator)
+    # 重新配置意味着用户想恢复自动登录
+    try:
+        PAUSE_PATH.unlink()
+    except OSError:
+        pass
     print(f"\n已保存（账号 {account}，上网方式 {operator}）")
     print("下一步：")
-    print("  1) 先自检一次：  python auto_login.py --status")
-    print("  2) 安装自启：    powershell -ExecutionPolicy Bypass -File .\\install.ps1")
+    print("  1) 环境自检：  python auto_login.py --diagnose")
+    print("  2) 安装自启：  powershell -ExecutionPolicy Bypass -File .\\install.ps1")
     return 0
 
 
 def main(argv=None) -> int:
+    global QUIET
+
     parser = argparse.ArgumentParser(
         description="TUST 校园网自动登录（无头版）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--setup", action="store_true", help="配置账号密码")
+    parser.add_argument("--diagnose", action="store_true", help="环境自检（IP/代理/网关/TUN）")
     parser.add_argument("--status", action="store_true", help="只查状态，不登录")
-    parser.add_argument("--logout", action="store_true", help="注销当前设备")
+    parser.add_argument("--logout", action="store_true", help="注销当前设备并暂停自动登录")
+    parser.add_argument("--resume", action="store_true", help="恢复自动登录")
     parser.add_argument("--watch", action="store_true", help="常驻巡检（开机自启用）")
-    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="巡检间隔秒，默认 300")
-    parser.add_argument("--wait", type=int, default=DEFAULT_WAIT, help="等网络就绪秒数，默认 180")
+    parser.add_argument("--interval", type=int, default=FAST_INTERVAL, help=f"异常时巡检间隔秒，默认 {FAST_INTERVAL}")
+    parser.add_argument("--interval-slow", type=int, default=SLOW_INTERVAL, help=f"稳定在线后巡检间隔秒，默认 {SLOW_INTERVAL}")
+    parser.add_argument("--wait", type=int, default=DEFAULT_WAIT, help=f"等网络就绪秒数，默认 {DEFAULT_WAIT}")
+    parser.add_argument("--campus-cidr", default=CAMPUS_CIDR, help=f"校园网段，默认 {CAMPUS_CIDR}")
+    parser.add_argument("--source-ip", default="", help="手动指定本机校园网 IPv4（TUN 抢占路由时用）")
     parser.add_argument("--quiet", action="store_true", help="不输出到控制台，只写日志")
     args = parser.parse_args(argv)
 
-    global QUIET
     QUIET = args.quiet
+    campus_net = campus_net_of(args.campus_cidr)
 
     if args.setup:
-        return cmd_setup()
+        return cmd_setup(campus_net)
+    if args.diagnose:
+        return do_diagnose(campus_net, args.source_ip)
+    if args.resume:
+        try:
+            PAUSE_PATH.unlink()
+            log("已恢复自动登录")
+        except OSError:
+            log("当前没有暂停标记，无需恢复")
+        return 0
     if args.status:
-        return do_status(min(args.wait, 30))
+        return do_status(args.wait, campus_net, args.source_ip)
     if args.logout:
-        return do_logout(min(args.wait, 60))
+        return do_logout(args.wait, campus_net, args.source_ip)
 
-    handle = acquire_mutex()
+    try:
+        handle = acquire_mutex()
+    except OSError as exc:
+        log(f"创建单实例互斥体失败：{exc}", "ERROR")
+        return 1
     if handle is None:
         log("已有实例在运行，本次退出")
         return 0
+
     try:
         if args.watch:
-            return do_watch(args)
-        return do_login(args.wait)
+            return do_watch(args, campus_net)
+        # 手动执行一次：视为用户想恢复自动登录
+        try:
+            PAUSE_PATH.unlink()
+        except OSError:
+            pass
+        return do_login(args.wait, campus_net, args.source_ip)
     finally:
         try:
             _k32.CloseHandle(ctypes.c_void_p(handle))
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
 
@@ -721,3 +1061,8 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception:  # noqa: BLE001  pythonw 没有 stderr，未捕获异常必须落盘
+        log("未捕获异常：\n" + traceback.format_exc(), "ERROR")
+        sys.exit(70)
