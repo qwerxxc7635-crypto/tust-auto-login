@@ -88,41 +88,94 @@ $action = New-ScheduledTaskAction -Execute $pywExe `
     -Argument ('"' + $scriptPy + '" --boot') `
     -WorkingDirectory $scriptDir
 
-# 触发器：开机 + 延迟 60 秒（等 Wi-Fi 关联和 DHCP）
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$trigger.Delay = 'PT60S'
+# 触发器：开机 + 延迟 60 秒（等 Wi-Fi 关联和 DHCP）+ 每 10 分钟重复（无限期）。
+# 用 XML 注册：cmdlet 的 -RepetitionDuration ([TimeSpan]::MaxValue) 会被序列化成
+# P99999999DT23H59M59S，任务计划程序判定越界（0x80041318）。
+# XML 里不写 <Duration> 就是"无限期"，这是唯一干净的表达方式。
+$xmlSafePy  = [Security.SecurityElement]::Escape($pywExe)
+$xmlSafeArg = [Security.SecurityElement]::Escape('"' + $scriptPy + '" --boot')
+$xmlSafeDir = [Security.SecurityElement]::Escape($scriptDir)
 
-# 每 10 分钟重复一次：万一认证在锁屏期间掉了，能自动补上。
-# 旧版系统对「无限期」支持不同，失败就退化成只跑一次并提示。
-$repeatOk = $true
+$taskXml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>TUST campus network: authenticate before user logon so the lock screen has network</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT60S</Delay>
+      <Repetition>
+        <Interval>PT10M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </BootTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>$xmlSafePy</Command>
+      <Arguments>$xmlSafeArg</Arguments>
+      <WorkingDirectory>$xmlSafeDir</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"@
+
+$registerMode = ''
 try {
+    Register-ScheduledTask -TaskName $TaskName -Xml $taskXml -Force -ErrorAction Stop | Out-Null
+    $registerMode = 'XML（每 10 分钟无限期重复）'
+} catch {
+    Write-Warning "XML 注册失败：$($_.Exception.Message)"
+    Write-Warning '改用备用方式：cmdlet + 24 小时重复窗口'
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $trigger.Delay = 'PT60S'
     $rep = New-ScheduledTaskTrigger -Once -At (Get-Date) `
         -RepetitionInterval (New-TimeSpan -Minutes 10) `
-        -RepetitionDuration ([TimeSpan]::MaxValue)
+        -RepetitionDuration (New-TimeSpan -Days 1)
     $trigger.Repetition = $rep.Repetition
-} catch {
-    $repeatOk = $false
+    $action = New-ScheduledTaskAction -Execute $pywExe `
+        -Argument ('"' + $scriptPy + '" --boot') -WorkingDirectory $scriptDir
+    $principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' `
+        -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 1)
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+        -Principal $principal -Settings $settings -Force | Out-Null
+    $registerMode = 'cmdlet（每 10 分钟，持续 24 小时）'
 }
-
-$principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' `
-    -LogonType ServiceAccount -RunLevel Highest
-
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable `
-    -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
-    -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 1)
-
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
-    -Principal $principal -Settings $settings -Force `
-    -Description 'TUST 校园网：用户登录前以 SYSTEM 身份完成网页认证，使锁屏界面具备网络' | Out-Null
 
 "已创建计划任务：$TaskName"
 "  身份   : SYSTEM（不需要保存任何账户密码）"
-"  触发   : 开机后 60 秒$(if ($repeatOk) { '，之后每 10 分钟重复' } else { '（重复触发器创建失败，只会在开机时跑一次）' })"
+"  触发   : 开机后 60 秒，之后 $registerMode"
 "  动作   : `"$pywExe`" `"$scriptPy`" --boot"
 "  日志   : $bootLog"
 ""
