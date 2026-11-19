@@ -7,16 +7,19 @@
         远程控制（UU 远程、ToDesk 等）才能连进来让你输密码。
 
   用法（必须以管理员身份运行 PowerShell）：
-    .\install-boot-task.ps1          创建/更新开机任务
-    .\install-boot-task.ps1 -Test    立刻触发一次，并显示 boot.log
-    .\install-boot-task.ps1 -Uninstall  删除任务
+    .\install-boot-task.ps1                   创建/更新开机任务
+    .\install-boot-task.ps1 -Test             立刻触发一次，并显示 boot.log
+    .\install-boot-task.ps1 -Uninstall        删除任务
+    .\install-boot-task.ps1 -DisableFastStartup  关闭快速启动（让"关机再开机"也触发）
+    .\install-boot-task.ps1 -EnableFastStartup   恢复快速启动
 
   和普通自启的区别：
     - 普通自启（install.ps1）在你登录后才跑，负责日常巡检；
     - 这个任务以 SYSTEM 身份在开机时跑，只做「一次性认证」，不常驻，
       所以两者不会互相抢登录。
 #>
-param([switch]$Uninstall, [switch]$Test)
+param([switch]$Uninstall, [switch]$Test,
+      [switch]$DisableFastStartup, [switch]$EnableFastStartup)
 
 $ErrorActionPreference = 'Stop'
 $TaskName = 'TUST-BootLogin'
@@ -37,6 +40,28 @@ function Assert-Admin {
 }
 
 Assert-Admin
+
+# 快速启动开关：开启时「关机再开机」是混合启动（内核从休眠镜像恢复、服务不重启），
+# 开机触发器不会触发 —— 这就是"重启有效、关机再开无效"的原因。
+$fastKey  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'
+$fastProp = 'HiberbootEnabled'
+
+if ($DisableFastStartup -or $EnableFastStartup) {
+    $value = if ($DisableFastStartup) { 0 } else { 1 }
+    $before = (Get-ItemProperty -Path $fastKey -Name $fastProp -ErrorAction SilentlyContinue).$fastProp
+    Set-ItemProperty -Path $fastKey -Name $fastProp -Value $value -Type DWord
+    $after = (Get-ItemProperty -Path $fastKey -Name $fastProp -ErrorAction SilentlyContinue).$fastProp
+    if ($DisableFastStartup) {
+        "已关闭快速启动：HiberbootEnabled $before → $after"
+        "  「关机再开机」将走完整冷启动，开机触发器会正常触发。"
+        "  代价：开机比之前慢几秒；休眠功能不受影响（hiberfil.sys 仍保留）。"
+        "  想恢复：.\install-boot-task.ps1 -EnableFastStartup"
+    } else {
+        "已恢复快速启动：HiberbootEnabled $before → $after"
+        "  注意：开启后「关机再开机」是混合启动，开机触发器可能不触发（重启仍然有效）。"
+    }
+    return
+}
 
 if ($Uninstall) {
     $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -183,8 +208,13 @@ try {
 "  1) .\install-boot-task.ps1 -Test     立即触发一次并看日志"
 "  2) 重启电脑，停在登录界面等 1~2 分钟，用手机 UU 连接"
 ""
-"两个容易漏的前提："
-"  - 若开着「快速启动」，关机再开机是混合启动，开机触发器可能不触发。"
-"    建议先测「重启」；确认没问题后再决定是否关闭快速启动。"
+$hb = (Get-ItemProperty -Path $fastKey -Name $fastProp -ErrorAction SilentlyContinue).$fastProp
+if ($hb -eq 1) {
+    "注意：检测到「快速启动」已开启（HiberbootEnabled=1）。"
+    "  「重启」能触发本任务，但「关机再开机」是混合启动，开机触发器可能不触发。"
+    "  想让关机再开机也生效，执行： .\install-boot-task.ps1 -DisableFastStartup"
+    ""
+}
+"另一个容易漏的前提："
 "  - 手机热点等其它 Wi-Fi 若也设为自动连接，开机可能连到热点导致没有校园网。"
 "    建议把热点改为「手动连接」。"

@@ -139,8 +139,14 @@ powershell -ExecutionPolicy Bypass -File .\install-boot-task.ps1
 
 1. 校园 Wi-Fi 必须是 all-user 配置文件并设为自动连接（`netsh wlan show profiles`
    里显示 `All User Profile`）；
-2. **快速启动**开着时（`HiberbootEnabled=1`）「关机再开机」是混合启动，开机触发器可能不触发
-   ——先测「重启」，或关掉快速启动；
+2. **快速启动**开着时（`HiberbootEnabled=1`）「关机再开机」是混合启动——内核从休眠镜像恢复、
+   服务不重启，**开机触发器不会触发**（「重启」不受影响）。要支持关机再开机，执行一次：
+
+   ```powershell
+   .\install-boot-task.ps1 -DisableFastStartup     # 恢复：-EnableFastStartup
+   ```
+
+   代价是开机比之前慢几秒，休眠功能不受影响；
 3. 其它自动连接的 Wi-Fi（手机热点等）可能抢在网络前面，导致开机连的是热点，建议改为手动连接。
 
 **验证**：
