@@ -45,7 +45,7 @@ from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener
 
-VERSION = "1.1.3"
+VERSION = "1.2.0"
 
 # ---------------------------------------------------------------- 常量
 
@@ -53,6 +53,14 @@ APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "TustAutoLogi
 CRED_PATH = APP_DIR / "cred.dat"
 LOG_PATH = APP_DIR / "auto-login.log"
 PAUSE_PATH = APP_DIR / "paused"
+
+# 登录前认证（--boot，由 SYSTEM 计划任务调用）：整套路径独立，不依赖用户环境变量
+BOOT_DIR = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "TustAutoLogin"
+BOOT_CRED = BOOT_DIR / "boot.dat"
+BOOT_LOG = BOOT_DIR / "boot.log"
+
+# 当前这份凭据是否用「机器范围」加密（--boot 用 True，普通模式用 False）
+CRED_MACHINE = False
 LOG_MAX_BYTES = 512 * 1024
 
 GATEWAY_HOST = "10.10.102.50"
@@ -163,6 +171,7 @@ _k32.LocalFree.argtypes = [ctypes.c_void_p]
 _k32.LocalFree.restype = ctypes.c_void_p
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
+CRYPTPROTECT_LOCAL_MACHINE = 0x4
 ENTROPY = b"TustAutoLogin-v1"
 
 
@@ -172,11 +181,12 @@ def _blob(data: bytes) -> _DATA_BLOB:
     return _DATA_BLOB(n, ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
 
 
-def dpapi_protect(data: bytes) -> bytes:
+def dpapi_protect(data: bytes, machine: bool = False) -> bytes:
+    flags = CRYPTPROTECT_UI_FORBIDDEN | (CRYPTPROTECT_LOCAL_MACHINE if machine else 0)
     blob_in, blob_ent, blob_out = _blob(data), _blob(ENTROPY), _DATA_BLOB()
     ok = _crypt32.CryptProtectData(
         ctypes.byref(blob_in), "TustAutoLogin", ctypes.byref(blob_ent),
-        None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out),
+        None, None, flags, ctypes.byref(blob_out),
     )
     if not ok:
         raise ctypes.WinError(ctypes.get_last_error())
@@ -200,20 +210,46 @@ def dpapi_unprotect(data: bytes) -> bytes:
         _k32.LocalFree(blob_out.pbData)
 
 
-def save_creds(account: str, password: str, operator: str) -> None:
+def save_creds(account: str, password: str, operator: str,
+               path: Path | None = None, machine: bool | None = None) -> None:
     """原子写入，避免巡检正好读到写了一半的文件。"""
+    target = path or CRED_PATH
+    use_machine = CRED_MACHINE if machine is None else machine
     payload = json.dumps(
         {"v": 1, "account": account, "password": password, "operator": operator},
         ensure_ascii=False,
     ).encode("utf-8")
-    blob = dpapi_protect(payload)
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CRED_PATH.with_name(CRED_PATH.name + ".tmp")
+    blob = dpapi_protect(payload, machine=use_machine)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
     with open(tmp, "wb") as fh:
         fh.write(blob)
         fh.flush()
         os.fsync(fh.fileno())
-    os.replace(tmp, CRED_PATH)
+    os.replace(tmp, target)
+
+
+def save_boot_creds(account: str, password: str, operator: str) -> str | None:
+    """额外写一份「机器范围」凭据给开机任务用。成功返回 None，失败返回原因。
+
+    机器范围（CRYPTPROTECT_LOCAL_MACHINE）意味着本机任何进程都能解密——这是
+    SYSTEM 在登录前能读到它的前提，也是这个方案的已知代价。
+    """
+    try:
+        save_creds(account, password, operator, path=BOOT_CRED, machine=True)
+        return None
+    except OSError as exc:
+        return str(exc)
+
+
+def use_boot_paths() -> None:
+    """切换到开机任务使用的路径（ProgramData 下，与用户目录完全隔离）。"""
+    global APP_DIR, CRED_PATH, LOG_PATH, PAUSE_PATH, CRED_MACHINE
+    APP_DIR = BOOT_DIR
+    CRED_PATH = BOOT_CRED
+    LOG_PATH = BOOT_LOG
+    PAUSE_PATH = BOOT_DIR / "paused"
+    CRED_MACHINE = True
 
 
 def load_creds_checked():
@@ -672,7 +708,10 @@ def do_login(max_wait: int, campus_net, source_ip: str = "") -> int:
 
     creds, cred_err = load_creds_checked()
     if creds is None and cred_err is None:
-        log("尚未配置账号，请先运行： python auto_login.py --setup", "ERROR")
+        if CRED_MACHINE:
+            log(f"开机凭据不存在（{CRED_PATH}）。请以当前用户运行一次 --setup 生成", "ERROR")
+        else:
+            log("尚未配置账号，请先运行： python auto_login.py --setup", "ERROR")
         return 2
     if creds is None:
         log(f"凭据读不了：{cred_err}", "ERROR")
@@ -916,6 +955,11 @@ def do_diagnose(campus_net, source_ip: str = "") -> int:
         log(f"凭据        : 无法读取 —— {err}", "WARN")
     else:
         log("凭据        : 未配置（先运行 --setup）", "WARN")
+    try:
+        boot_state = f"存在（{BOOT_CRED.stat().st_size} 字节）" if BOOT_CRED.exists() else "不存在（运行 --setup 会自动生成）"
+    except OSError:
+        boot_state = "无法读取"
+    log(f"开机凭据    : {BOOT_CRED} {boot_state}")
     log(f"暂停标记    : {'存在（已暂停）' if PAUSE_PATH.exists() else '无'}")
 
     log(f"校园网段    : {campus_net}")
@@ -954,6 +998,27 @@ def do_diagnose(campus_net, source_ip: str = "") -> int:
 
 
 # ---------------------------------------------------------------- 配置
+
+
+def cmd_setup_boot() -> int:
+    """把已有的普通凭据复制一份成「机器范围」的开机凭据，不需要重输密码。"""
+    creds, err = load_creds_checked()
+    if creds is None and err is None:
+        print("还没有普通凭据，请先运行： python auto_login.py --setup")
+        return 2
+    if creds is None:
+        print(f"读取普通凭据失败：{err}")
+        return 1
+    problem = save_boot_creds(creds["account"], creds["password"], creds["operator"])
+    if problem:
+        print(f"写入开机凭据失败：{problem}")
+        print("可以试过用管理员身份重跑本命令，或直接重跑 --setup。")
+        return 1
+    print(f"已写入开机凭据：{BOOT_CRED}")
+    print(f"  账号 {mask_account(creds['account'])}，上网方式 {creds.get('operator', '?')}")
+    print("下一步（管理员 PowerShell）：")
+    print("  powershell -ExecutionPolicy Bypass -File .\\install-boot-task.ps1")
+    return 0
 
 
 def cmd_setup(campus_net) -> int:
@@ -1009,6 +1074,13 @@ def cmd_setup(campus_net) -> int:
     except OSError:
         pass
     print(f"\n已保存（账号 {account}，上网方式 {operator}）")
+
+    boot_err = save_boot_creds(account, password, operator)
+    if boot_err:
+        print(f"  ⚠ 开机任务用的凭据没能写入（{boot_err}）")
+        print(f"    如果要用「登录前自动认证」，请以管理员身份重跑一次 --setup")
+    else:
+        print(f"  已同时写入开机任务用的凭据：{BOOT_CRED}")
     print("下一步：")
     print("  1) 环境自检：  python auto_login.py --diagnose")
     print("  2) 安装自启：  powershell -ExecutionPolicy Bypass -File .\\install.ps1")
@@ -1023,11 +1095,15 @@ def main(argv=None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--setup", action="store_true", help="配置账号密码")
+    parser.add_argument("--setup-boot", action="store_true",
+                        help="由已有凭据生成开机任务用的凭据（免重输密码）")
     parser.add_argument("--diagnose", action="store_true", help="环境自检（IP/代理/网关/TUN）")
     parser.add_argument("--status", action="store_true", help="只查状态，不登录")
     parser.add_argument("--logout", action="store_true", help="注销当前设备并暂停自动登录")
     parser.add_argument("--resume", action="store_true", help="恢复自动登录")
     parser.add_argument("--watch", action="store_true", help="常驻巡检（开机自启用）")
+    parser.add_argument("--boot", action="store_true",
+                        help="登录前认证：用机器范围凭据跑一次（由 SYSTEM 计划任务调用）")
     parser.add_argument("--interval", type=int, default=FAST_INTERVAL, help=f"异常时巡检间隔秒，默认 {FAST_INTERVAL}")
     parser.add_argument("--interval-slow", type=int, default=SLOW_INTERVAL, help=f"稳定在线后巡检间隔秒，默认 {SLOW_INTERVAL}")
     parser.add_argument("--wait", type=int, default=DEFAULT_WAIT, help=f"等网络就绪秒数，默认 {DEFAULT_WAIT}")
@@ -1041,6 +1117,8 @@ def main(argv=None) -> int:
 
     if args.setup:
         return cmd_setup(campus_net)
+    if args.setup_boot:
+        return cmd_setup_boot()
     if args.diagnose:
         return do_diagnose(campus_net, args.source_ip)
     if args.resume:
@@ -1054,6 +1132,12 @@ def main(argv=None) -> int:
         return do_status(args.wait, campus_net, args.source_ip)
     if args.logout:
         return do_logout(args.wait, campus_net, args.source_ip)
+
+    if args.boot:
+        # 登录前认证：路径全部切到 ProgramData，不碰用户目录，也不受用户会话影响
+        use_boot_paths()
+        log(f"===== 开机认证 v{VERSION}（身份 {os.environ.get('USERNAME', '?')}）=====")
+        return do_login(args.wait, campus_net, args.source_ip)
 
     try:
         handle = acquire_mutex()

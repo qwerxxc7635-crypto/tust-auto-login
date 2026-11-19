@@ -30,6 +30,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 | `python auto_login.py --status` | 只查状态，不登录 |
 | `python auto_login.py` | 现在手动执行一次（同时解除暂停） |
 | `python auto_login.py --watch` | 常驻巡检（开机自启用它） |
+| `python auto_login.py --boot` | 登录前认证：用机器范围凭据跑一次，供 SYSTEM 计划任务调用 |
+| `.\install-boot-task.ps1` | 创建"开机即认证"的 SYSTEM 计划任务（需管理员） |
 | `python auto_login.py --logout` | 注销当前设备，并**暂停**自动登录 |
 | `python auto_login.py --resume` | 恢复自动登录 |
 | `.\install.ps1 -Uninstall` | 卸载启动项、结束进程（保留凭据） |
@@ -105,14 +107,61 @@ Get-Content -Tail 20 -Wait "$env:LOCALAPPDATA\TustAutoLogin\auto-login.log"
 门户状态    : 已在线（****@unicom）
 ```
 
+## 登录前认证（开机就有网，用于远程控制）
+
+**为什么需要**：默认的 `install.ps1` 是「登录后才启动」。如果你在锁屏界面就需要网络
+——比如想让 UU 远程 / ToDesk 连进来、由你在远处输入密码——那必须在**任何用户登录之前**
+完成认证。
+
+**做法**（管理员 PowerShell）：
+
+```powershell
+python auto_login.py --setup                      # 会同时写出开机用的凭据
+powershell -ExecutionPolicy Bypass -File .\install-boot-task.ps1
+```
+
+生成的计划任务：
+
+| 项 | 值 |
+|---|---|
+| 身份 | SYSTEM（**不需要保存你的账户密码**） |
+| 触发 | 开机后 60 秒，之后每 10 分钟重复 |
+| 动作 | `pythonw.exe auto_login.py --boot` |
+| 凭据 | `C:\ProgramData\TustAutoLogin\boot.dat`（机器范围 DPAPI） |
+| 日志 | `C:\ProgramData\TustAutoLogin\boot.log` |
+
+任务只做**一次性认证**就退出、不常驻，所以不会和登录后的常驻巡检抢登录。
+
+**已知代价**：机器范围加密意味着**本机任何进程都能解密**这份凭据——这是 SYSTEM 在无用户
+登录时能读到它的前提。单用户机器可以接受，多人共用不建议。
+
+**三个前提**（缺一个都白搭）：
+
+1. 校园 Wi-Fi 必须是 all-user 配置文件并设为自动连接（`netsh wlan show profiles`
+   里显示 `All User Profile`）；
+2. **快速启动**开着时（`HiberbootEnabled=1`）「关机再开机」是混合启动，开机触发器可能不触发
+   ——先测「重启」，或关掉快速启动；
+3. 其它自动连接的 Wi-Fi（手机热点等）可能抢在网络前面，导致开机连的是热点，建议改为手动连接。
+
+**验证**：
+
+```powershell
+.\install-boot-task.ps1 -Test        # 立刻跑一次并打印 boot.log
+```
+
+然后重启，停在登录界面等 1~2 分钟，用手机远控连一下。
+
 ## 文件说明
 
 | 文件 | 说明 |
 |---|---|
 | `auto_login.py` | 主脚本，纯标准库 |
 | `install.ps1` | 启动项安装 / 卸载（不需要管理员权限） |
+| `install-boot-task.ps1` | 登录前认证的 SYSTEM 计划任务创建 / 删除（需管理员） |
 | `%LOCALAPPDATA%\TustAutoLogin\cred.dat` | 账号密码，Windows DPAPI 加密，只有当前用户能解密 |
 | `%LOCALAPPDATA%\TustAutoLogin\auto-login.log` | 运行日志，账号已脱敏（`****@unicom`） |
+| `C:\ProgramData\TustAutoLogin\boot.dat` | 开机任务专用凭据，机器范围加密（仅启用登录前认证时存在） |
+| `C:\ProgramData\TustAutoLogin\boot.log` | 开机任务日志 |
 
 ## 已知限制
 
